@@ -4,17 +4,32 @@
     <meta charset="UTF-8">
     <meta http-equiv="X-UA-Compatible" content="IE=edge">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Audio Showcase</title>
+    <link rel="stylesheet" href="styles.css">
+    <title>Audio Comparison</title>
 </head>
 <body>
 
-<h1>My Audio Showcase</h1>
+<div class="audio-container">
+    <div class="audio-card" id="audio1">
+        <h2>Audio 1</h2>
+        <audio controls>
+            <source src="audio_samples/mtdiffusion/DogBark/003.wav" type="audio/wav">
+            Your browser does not support the audio tag.
+        </audio>
+    </div>
 
-<audio controls>
-  <!-- 替换下面的链接为你的音频文件链接 -->
-  <source src="audio_samples/mtdiffusion/DogBark/002.wav" type="audio/wav">
-  Your browser does not support the audio tag.
-</audio>
+    <div class="audio-card" id="audio2">
+        <h2>Audio 2</h2>
+        <audio controls>
+            <source src="audio_samples/mtdiffusion/DogBark/002.wav" type="audio/wav">
+            Your browser does not support the audio tag.
+        </audio>
+    </div>
+    
+    <!-- Add more audio cards as needed -->
+</div>
 
+<script src="index.js"></script>
 </body>
 </html>
+
