@@ -1,9 +1,14 @@
-<<<<<<< HEAD
-h1 {
-    color: red;
+/* index.css */
+
+body {
+    font-family: 'Arial', sans-serif;
+    margin: 20px;
+    padding: 20px;
+    background-color: #f4f4f4;
 }
-=======
+
 h1 {
-    color: red;
+    color: #0366d6;
 }
->>>>>>> f0baf1a8b0ec51f8e0e58b27b8799d278fe07b20
+
+/* 可以在这里添加更多的CSS样式，以美化你的页面 */
