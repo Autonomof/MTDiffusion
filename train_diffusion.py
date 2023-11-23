@@ -20,7 +20,7 @@ amp = None
 from datasets import LMDBDataset
 # from pixelsnail import PixelSNAIL
 from scheduler import CycleScheduler
-from bit_diffusion.conditional_bit_diffusion.bit_diffusion_v3 import BitDiffusion, Unet
+from bit_diffusion.conditional_mtdiffusion.mtdiffusion import MTDiffusion, Unet
 
 clas_dict: dict = {
     "DogBark": 0,

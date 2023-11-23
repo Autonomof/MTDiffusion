@@ -3,7 +3,8 @@ from pathlib import Path
 from random import random
 from functools import partial
 from multiprocessing import cpu_count
-import random
+
+
 import torch
 from torch import nn, einsum
 from torch.special import expm1
@@ -18,13 +19,14 @@ from einops.layers.torch import Rearrange
 
 # from PIL import Image
 from tqdm.auto import tqdm
-# from ema_pytorch import EMA
+from ema_pytorch import EMA
+
+from accelerate import Accelerator
 
 # constants
 
 BITS = 9
 MaxNum = 2 ** BITS - 1
-
 
 # helpers functions
 
@@ -62,24 +64,21 @@ def convert_image_to(pil_img_type, image):
         return image.convert(pil_img_type)
     return image
 
-
 class ScaleUpsample(nn.Module):
     def __init__(self, dim):
         super().__init__()
-        self.conv = nn.ConvTranspose2d(dim, dim, (5, 45), stride=(7, 1), padding=(5, 1))
+        self.conv = nn.ConvTranspose2d(dim, dim, (5,45), stride=(7, 1), padding=(5, 1))
 
     def forward(self, x):
         return self.conv(x)
-
 
 class ScaleDownsample(nn.Module):
     def __init__(self, dim):
         super().__init__()
-        self.conv = nn.Conv2d(dim, dim, (5, 45), stride=(7, 1), padding=(5, 1))
+        self.conv = nn.Conv2d(dim,dim,(5,45), stride=(7, 1), padding=(5, 1))
 
     def forward(self, x):
         return self.conv(x)
-
 
 # small helper modules
 
@@ -257,6 +256,7 @@ class Unet(nn.Module):
             dim_mults=(1, 2, 4, 8),
             # channels = 3,
             channels=1,
+            bits=BITS,
             resnet_block_groups=8,
             learned_sinusoidal_dim=16
     ):
@@ -267,7 +267,7 @@ class Unet(nn.Module):
         # channels *= bits
         self.channels = channels
 
-        input_channels = channels
+        input_channels = channels * 2
 
         init_dim = default(init_dim, dim)
         self.init_conv = nn.Conv2d(input_channels, init_dim, 7, padding=3)
@@ -291,16 +291,10 @@ class Unet(nn.Module):
             nn.Linear(time_dim, time_dim)
         )
 
-        num_labels = 7
-        self.label_embedding = torch.nn.Embedding(num_labels, time_dim)
-
         # layers
 
         self.downs = nn.ModuleList([])
         self.ups = nn.ModuleList([])
-
-        self.ups_noise = nn.ModuleList([])
-
         num_resolutions = len(in_out)
 
         for ind, (dim_in, dim_out) in enumerate(in_out):
@@ -330,30 +324,14 @@ class Unet(nn.Module):
         self.final_res_block = block_klass(dim * 2, dim, time_emb_dim=time_dim)
         self.final_conv = nn.Conv2d(dim, channels, 1)
 
-        ### noise up block
-        for ind, (dim_in, dim_out) in enumerate(reversed(in_out)):
-            is_last = ind == (len(in_out) - 1)
+    def forward(self, x, time, x_self_cond=None):
 
-            self.ups_noise.append(nn.ModuleList([
-                block_klass(dim_out + dim_in, dim_out, time_emb_dim=time_dim),
-                block_klass(dim_out + dim_in, dim_out, time_emb_dim=time_dim),
-                Residual(PreNorm(dim_out, LinearAttention(dim_out))),
-                Upsample(dim_out, dim_in) if not is_last else nn.Conv2d(dim_out, dim_in, 3, padding=1)
-            ]))
-
-        self.final_res_block_noise = block_klass(dim * 2, dim, time_emb_dim=time_dim)
-        self.final_conv_noise = nn.Conv2d(dim, channels, 1)
-
-    def forward(self, x, time, label):
-
-        # x_self_cond = default(x_self_cond, lambda: torch.zeros_like(x))
-        # x = torch.cat((x_self_cond, x), dim=1)
+        x_self_cond = default(x_self_cond, lambda: torch.zeros_like(x))
+        x = torch.cat((x_self_cond, x), dim=1)
         x = self.init_conv(x)
         r = x.clone()
 
         t = self.time_mlp(time)
-        c = self.label_embedding(label)
-        t += c.squeeze(1)
 
         h = []
 
@@ -371,9 +349,6 @@ class Unet(nn.Module):
         x = self.mid_attn(x)
         x = self.mid_block2(x, t)
 
-        h_noise = [sub_h.clone() for sub_h in h]
-        x_noise = x.clone()
-
         for block1, block2, attn, upsample in self.ups:
             x = torch.cat((x, h.pop()), dim=1)
             x = block1(x, t)
@@ -387,20 +362,7 @@ class Unet(nn.Module):
         x = torch.cat((x, r), dim=1)
 
         x = self.final_res_block(x, t)
-        for block1, block2, attn, upsample in self.ups_noise:
-            x_noise = torch.cat((x_noise, h_noise.pop()), dim=1)
-            x_noise = block1(x_noise, t)
-
-            x_noise = torch.cat((x_noise, h_noise.pop()), dim=1)
-            x_noise = block2(x_noise, t)
-            x_noise = attn(x_noise)
-
-            x_noise = upsample(x_noise)
-
-        x_noise = torch.cat((x_noise, r), dim=1)
-
-        x_noise = self.final_res_block(x_noise, t)
-        return self.final_conv(x),self.final_conv_noise(x_noise)
+        return self.final_conv(x)
 
 
 # convert to bit representations and back
@@ -432,7 +394,6 @@ def bits_to_decimal(x, bits=BITS):
     # return (dec / MaxNum).clamp(0., 1.)
     return dec
 
-
 # bit diffusion class
 
 def log(t, eps=1e-20):
@@ -459,7 +420,7 @@ def log_snr_to_alpha_sigma(log_snr):
     return torch.sqrt(torch.sigmoid(log_snr)), torch.sqrt(torch.sigmoid(-log_snr))
 
 
-class BitDiffusion(nn.Module):
+class MTDiffusion(nn.Module):
     def __init__(
             self,
             model,
@@ -469,7 +430,7 @@ class BitDiffusion(nn.Module):
             use_ddim=False,
             noise_schedule='cosine',
             time_difference=0.,
-            bit_scale=1.
+            bit_scale=5.
     ):
         super().__init__()
         self.model = model
@@ -512,23 +473,31 @@ class BitDiffusion(nn.Module):
         return times
 
     @torch.no_grad()
-    def ddpm_sample(self, shape, labels, time_difference=None):
+    def ddpm_sample(self, shape, time_difference=None):
         batch, device = shape[0], self.device
 
-        # time_difference = default(time_difference, self.time_difference)
+        time_difference = default(time_difference, self.time_difference)
 
         time_pairs = self.get_sampling_timesteps(batch, device=device)
 
         img = torch.randn(shape, device=device)
 
-        # x_start = None
+        x_start = None
 
         for time, time_next in tqdm(time_pairs, desc='sampling loop time step', total=self.timesteps):
             # add the time delay
-            print('use ddpm')
+
             time_next = (time_next - self.time_difference).clamp(min=0.)
 
             noise_cond = self.log_snr(time)
+
+            # get predicted x0
+
+            x_start = self.model(img, noise_cond, x_start)
+
+            # clip x0
+
+            x_start.clamp_(-self.bit_scale, self.bit_scale)
 
             # get log(snr)
 
@@ -544,16 +513,6 @@ class BitDiffusion(nn.Module):
             # derive posterior mean and variance
 
             c = -expm1(log_snr - log_snr_next)
-
-            # get predicted x0
-
-            x_start, pred_noise = self.model(img, noise_cond, labels)
-            # x_start, pred_noise = pred.chunk(2, dim=1)
-            # clip x0
-
-            # x_start.clamp_(-self.bit_scale, self.bit_scale)
-
-
 
             mean = alpha_next * (img * (1 - c) / alpha + c * x_start)
             variance = (sigma_next ** 2) * c
@@ -573,20 +532,20 @@ class BitDiffusion(nn.Module):
         # print(img)
         # img = img / self.bit_scale
         # return bits_to_decimal(img)
-        return img
+        return  img
 
     @torch.no_grad()
-    def ddim_sample(self, shape, labels, time_difference=None):
+    def ddim_sample(self, shape, time_difference=None):
         batch, device = shape[0], self.device
 
-        # time_difference = default(time_difference, self.time_difference)
+        time_difference = default(time_difference, self.time_difference)
 
         time_pairs = self.get_sampling_timesteps(batch, device=device)
 
         img = torch.randn(shape, device=device)
 
         x_start = None
-        i=0
+
         for times, times_next in tqdm(time_pairs, desc='sampling loop time step'):
             # get times and noise levels
 
@@ -600,23 +559,20 @@ class BitDiffusion(nn.Module):
 
             # add the time delay
 
-            # times_next = (times_next - time_difference).clamp(min=0.)
+            times_next = (times_next - time_difference).clamp(min=0.)
 
             # predict x0
 
-            x_start,pred_noise = self.model(img, log_snr, labels)
+            x_start = self.model(img, log_snr, x_start)
 
             # clip x0
 
-            # x_start.clamp_(-self.bit_scale, self.bit_scale)
+            x_start.clamp_(-self.bit_scale, self.bit_scale)
 
             # get predicted noise
-            # x_start,pred_noise = pred.chunk(2,dim=1)
-            # if i !=0:
-            #     pred_noise = (img - alpha * x_start) / sigma.clamp(min=1e-8)
-            # i += 1
+
             pred_noise = (img - alpha * x_start) / sigma.clamp(min=1e-8)
-            # x_start = (img -  pred_noise*sigma)/alpha.clamp(min=1e-8)
+
             # calculate x next
 
             img = x_start * alpha_next + pred_noise * sigma_next
@@ -625,14 +581,13 @@ class BitDiffusion(nn.Module):
         # img = self.scale_downsample(img)
         # return bits_to_decimal(img)
         return img
-
     @torch.no_grad()
-    def sample(self, labels, batch_size=16):
+    def sample(self, batch_size=16):
         image_size, channels = self.image_size, self.channels
         sample_fn = self.ddpm_sample if not self.use_ddim else self.ddim_sample
-        return sample_fn((batch_size, channels, image_size[0], image_size[1]), labels)
+        return sample_fn((batch_size, channels, image_size[0], image_size[1]))
 
-    def forward(self, img, labels, *args, **kwargs):
+    def forward(self, img, *args, **kwargs):
         batch, c, h, w, device, img_size, = *img.shape, img.device, self.image_size
         # print(batch, c, h, w, device, img_size)
         assert h == img_size[0] and w == img_size[1], f'height and width of image must be {img_size}'
@@ -660,25 +615,25 @@ class BitDiffusion(nn.Module):
         noise_level = self.log_snr(times)
         padded_noise_level = right_pad_dims_to(img, noise_level)
         alpha, sigma = log_snr_to_alpha_sigma(padded_noise_level)
+
         noised_img = alpha * img + sigma * noise
 
         # if doing self-conditioning, 50% of the time, predict x_start from current set of times
         # and condition with unet with that
         # this technique will slow down training by 25%, but seems to lower FID significantly
 
-        # self_cond = None
-        # if random() < 0.5:
-        #     with torch.no_grad():
-        #         self_cond = self.model(noised_img, noise_level).detach_()
+        self_cond = None
+        if random() < 0.5:
+            with torch.no_grad():
+                self_cond = self.model(noised_img, noise_level).detach_()
 
         # predict and take gradient step
 
-        pred_img, pred_noise = self.model(noised_img, noise_level, labels)
-        # pred_img, pred_noise = pred.chunk(2,dim=1)
+        pred = self.model(noised_img, noise_level, self_cond)
         # pred = self.scale_downsample(pred)
         # print('1',pred.shape,img.shape)
         # print(bits_to_decimal(pred))
-        return F.mse_loss(pred_img, img),F.mse_loss(pred_noise, noise)
+        return F.mse_loss(pred, img)
 
     # def scale_upsample(self,x):
     #     return self.scale_upsample(x)

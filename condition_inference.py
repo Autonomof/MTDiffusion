@@ -18,7 +18,7 @@ from einops import rearrange, reduce, repeat
 
 # from vqvae import VQVAE
 # from pixelsnail import PixelSNAIL
-from bit_diffusion.conditional_bit_diffusion.bit_diffusion_v3 import BitDiffusion, Unet
+from bit_diffusion.conditional_mtdiffusion.mtdiffusion import MTDiffusion, Unet
 from HiFiGanWrapper import HiFiGanWrapper
 from rvqvae import SoundStream
 import sys
